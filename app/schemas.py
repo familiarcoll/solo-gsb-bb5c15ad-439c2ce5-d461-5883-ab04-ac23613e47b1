@@ -170,6 +170,22 @@ class LoopRange(BaseModel):
         return self
 
 
+class HandoffUpdate(BaseModel):
+    """演员临时替补交接：携带当前进度代际做乐观锁。
+
+    原演员必须已上报（在参与者中有记录）；替补在本代际必须尚未参与（不在
+    参与者中，也未在本代际交接退场）。相同目标（同一原演员、同一替补）的
+    重试为幂等空操作；同一原演员在本代际再次交接给不同替补返回 409。
+    """
+
+    expected_progress_epoch: int = Field(
+        ge=0, description="客户端已知的进度代际；与当前不一致时返回 409"
+    )
+    substitute_id: str = Field(
+        min_length=1, max_length=100, description="替补参与者 ID；本代际须尚未参与"
+    )
+
+
 class LoopUpdate(BaseModel):
     """导演设置或清除循环排练区间，携带循环配置版本做乐观并发控制。
 

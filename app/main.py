@@ -39,6 +39,14 @@ loop_version 乐观锁）：区间起止行必须属于当前台本、起点小�
 参与者进度并累加 loop_count，使旧代际上报返回 409；终点上存在未释放
 止点时只停在终点，放行后按当前活跃进度重算，满足条件即回环。整体导入
 或增量修订台本时清除循环，实际清除递增 loop_version。
+
+导演可将演员临时交接给替补（PUT /rooms/{room_id}/participants/{participant_id}/handoff，
+携带当前 progress_epoch 做乐观锁）：原演员须已上报、替补在本代际尚未参与。
+成功时在单一事务中把原演员的当前位置与在线时间转给替补（替补的事件序号
+从头计算），公共位置不变、推进贡献不中断；原演员在本代际被标记退场，
+后续迟到上报返回 409，且不与替补同时计入 quorum。相同目标的重试为幂等，
+不同目标再次交接返回 409；新进度代际（校准/重导/回环）清除退场限制。
+GET /rooms/{room_id}/handoffs 查询房间交接记录。
 """
 
 from __future__ import annotations
@@ -56,6 +64,7 @@ from .schemas import (
     ClockUpdate,
     CursorUpdate,
     EventReport,
+    HandoffUpdate,
     HoldsRelease,
     HoldsSet,
     LinesImport,
@@ -78,7 +87,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.5.0",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -347,6 +356,38 @@ def _loop_config(room) -> Optional[Dict[str, Any]]:
     return {"start": room["loop_start"], "end": room["loop_end"]}
 
 
+def _handoff_payload(row) -> Dict[str, Any]:
+    """一条交接记录的对外表示（handoffs 表行）。"""
+    return {
+        "epoch": row["epoch"],
+        "participant_id": row["participant_id"],
+        "substitute_id": row["substitute_id"],
+        "position": row["position"],
+        "last_seq": row["last_seq"],
+        "at": row["created_at"],
+    }
+
+
+def _retired_participants(conn, room_id: str, epoch: int) -> List[Dict[str, Any]]:
+    """当前进度代际内已交接退场的演员及其替补（按交接顺序）。"""
+    return [
+        {
+            "participant_id": row["participant_id"],
+            "substitute_id": row["substitute_id"],
+            "at": row["created_at"],
+        }
+        for row in conn.execute(
+            """
+            SELECT participant_id, substitute_id, created_at
+            FROM handoffs
+            WHERE room_id = ? AND epoch = ?
+            ORDER BY id
+            """,
+            (room_id, epoch),
+        ).fetchall()
+    ]
+
+
 def _room_payload(room) -> Dict[str, Any]:
     return {
         "room_id": room["id"],
@@ -428,6 +469,7 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "public_position": public_position,
         "current_line": current_line,
         "active_participants": participants,
+        "retired_participants": _retired_participants(conn, room_id, room["progress_epoch"]),
         "last_advancement": last_advancement,
         "paused": bool(room["paused"]),
         "clock_version": room["clock_version"],
@@ -534,6 +576,8 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
         conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM advancements WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM holds WHERE room_id = ?", (room_id,))
+        # 交接记录（含退场限制）随整体重导一并清空；新代际下原演员可重新参与
+        conn.execute("DELETE FROM handoffs WHERE room_id = ?", (room_id,))
         conn.commit()
         return {
             "room_id": room_id,
@@ -768,6 +812,21 @@ def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
                     f"当前 progress_epoch={room['progress_epoch']}"
                 ),
             )
+        retired = conn.execute(
+            """
+            SELECT substitute_id FROM handoffs
+            WHERE room_id = ? AND participant_id = ? AND epoch = ?
+            """,
+            (room_id, event.participant_id, room["progress_epoch"]),
+        ).fetchone()
+        if retired is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"参与者已在本代际交接退场: participant_id={event.participant_id}, "
+                    f"替补={retired['substitute_id']}；迟到上报不再计入"
+                ),
+            )
         lines_count = conn.execute(
             "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
         ).fetchone()["c"]
@@ -808,6 +867,162 @@ def report_event(room_id: str, event: EventReport) -> Dict[str, Any]:
             "progress_epoch": fresh_room["progress_epoch"],
             "advancement": advancement,
             "state": _state_payload(conn, fresh_room, now),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+@app.put("/rooms/{room_id}/participants/{participant_id}/handoff")
+def handoff_participant(room_id: str, participant_id: str, payload: HandoffUpdate) -> Dict[str, Any]:
+    """导演把原演员的当前进度临时交接给替补（本代际内原演员退场）。
+
+    携带客户端已知的 ``expected_progress_epoch`` 做乐观锁：与当前代际不一致
+    返回 409、状态不变。原演员必须已上报（在参与者中有记录），替补在本代际
+    必须尚未参与（不在参与者中，也未在本代际交接退场）；任一不满足返回
+    409、状态不变。校验通过后在同一事务中：
+
+    1. 原演员从参与者中移除（本代际标记退场），其当前位置与在线时间原样
+       转给替补，替补的事件序号从头计算；公共位置不变，该位置对 quorum 的
+       推进贡献由替补无缝继承、不中断，交接本身不触发推进重算；
+    2. 写入一条交接记录（GET /rooms/{room_id}/handoffs 可查）。原演员此后
+       的迟到上报返回 409，且不会与替补同时计入 quorum。
+
+    相同目标（同一原演员、同一替补）的重试为幂等空操作：返回已存在的交接
+    记录、``changed: false``（即便携带过期代际也视为成功重试）；同一原演员
+    在本代际再次交接给不同替补返回 409。新进度代际（导演校准、台本整体
+    导入、循环回环）开启后退场限制自动解除，原演员可重新上报参与；台本
+    整体导入同时清空交接记录。暂停期间导演仍可交接。
+    """
+    now = _now()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        room = _get_room(conn, room_id)
+        epoch = room["progress_epoch"]
+
+        existing = conn.execute(
+            """
+            SELECT * FROM handoffs
+            WHERE room_id = ? AND participant_id = ? AND epoch = ?
+            """,
+            (room_id, participant_id, epoch),
+        ).fetchone()
+        if existing is not None:
+            if existing["substitute_id"] == payload.substitute_id:
+                # 相同目标重试：幂等返回已存在的交接记录，不重复转移
+                conn.commit()
+                fresh = _get_room(conn, room_id)
+                return {
+                    "changed": False,
+                    "room_id": room_id,
+                    "participant_id": participant_id,
+                    "substitute_id": payload.substitute_id,
+                    "progress_epoch": fresh["progress_epoch"],
+                    "handoff": _handoff_payload(existing),
+                    "state": _state_payload(conn, fresh, now),
+                }
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"演员在本代际已交接给其他替补: participant_id={participant_id}, "
+                    f"已交接给 {existing['substitute_id']}，无法再交接给 "
+                    f"{payload.substitute_id}"
+                ),
+            )
+
+        if payload.expected_progress_epoch != epoch:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"进度代际不匹配: expected_progress_epoch="
+                    f"{payload.expected_progress_epoch}, 当前 progress_epoch={epoch}"
+                ),
+            )
+
+        source = conn.execute(
+            """
+            SELECT position, last_seq, last_seen_at FROM participants
+            WHERE room_id = ? AND participant_id = ?
+            """,
+            (room_id, participant_id),
+        ).fetchone()
+        if source is None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"原演员尚未上报，无法交接: participant_id={participant_id}",
+            )
+
+        substitute = conn.execute(
+            """
+            SELECT 1 FROM participants
+            WHERE room_id = ? AND participant_id = ?
+            """,
+            (room_id, payload.substitute_id),
+        ).fetchone()
+        if substitute is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"替补在本代际已参与: substitute_id={payload.substitute_id}",
+            )
+        substitute_retired = conn.execute(
+            """
+            SELECT 1 FROM handoffs
+            WHERE room_id = ? AND participant_id = ? AND epoch = ?
+            """,
+            (room_id, payload.substitute_id, epoch),
+        ).fetchone()
+        if substitute_retired is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"替补在本代际已交接退场，不能再作为替补: "
+                    f"substitute_id={payload.substitute_id}"
+                ),
+            )
+
+        # 单一事务：原演员退场（从参与者移除），替补继承其位置与在线时间、
+        # 事件序号从头计算；公共位置不变，推进贡献由替补无缝继承
+        conn.execute(
+            "DELETE FROM participants WHERE room_id = ? AND participant_id = ?",
+            (room_id, participant_id),
+        )
+        conn.execute(
+            """
+            INSERT INTO participants (room_id, participant_id, last_seq, position, last_seen_at)
+            VALUES (?, ?, -1, ?, ?)
+            """,
+            (room_id, payload.substitute_id, source["position"], source["last_seen_at"]),
+        )
+        conn.execute(
+            """
+            INSERT INTO handoffs (room_id, epoch, participant_id, substitute_id,
+                                  position, last_seq, last_seen_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (room_id, epoch, participant_id, payload.substitute_id,
+             source["position"], source["last_seq"], source["last_seen_at"], now),
+        )
+        conn.commit()
+
+        fresh = _get_room(conn, room_id)
+        return {
+            "changed": True,
+            "room_id": room_id,
+            "participant_id": participant_id,
+            "substitute_id": payload.substitute_id,
+            "progress_epoch": fresh["progress_epoch"],
+            "handoff": {
+                "epoch": epoch,
+                "participant_id": participant_id,
+                "substitute_id": payload.substitute_id,
+                "position": source["position"],
+                "last_seq": source["last_seq"],
+                "at": now,
+            },
+            "state": _state_payload(conn, fresh, now),
         }
     except Exception:
         conn.rollback()
@@ -1315,6 +1530,27 @@ def get_state(room_id: str) -> Dict[str, Any]:
     try:
         room = _get_room(conn, room_id)
         return _state_payload(conn, room, now)
+    finally:
+        conn.close()
+
+
+@app.get("/rooms/{room_id}/handoffs")
+def list_handoffs(room_id: str) -> Dict[str, Any]:
+    """房间的演员交接记录（全部进度代际，按发生顺序）。"""
+    conn = connect()
+    try:
+        _get_room(conn, room_id)
+        rows = conn.execute(
+            """
+            SELECT epoch, participant_id, substitute_id, position, last_seq, created_at
+            FROM handoffs WHERE room_id = ? ORDER BY id
+            """,
+            (room_id,),
+        ).fetchall()
+        return {
+            "room_id": room_id,
+            "handoffs": [_handoff_payload(row) for row in rows],
+        }
     finally:
         conn.close()
 
