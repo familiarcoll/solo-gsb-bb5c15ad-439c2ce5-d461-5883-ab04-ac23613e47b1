@@ -73,6 +73,25 @@ CREATE TABLE IF NOT EXISTS holds (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_holds_pending
     ON holds(room_id, position) WHERE released = 0;
 CREATE INDEX IF NOT EXISTS idx_holds_room ON holds(room_id, released, position);
+
+CREATE TABLE IF NOT EXISTS handoffs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id         TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    progress_epoch  INTEGER NOT NULL,  -- 交接发生的进度代际（退场限制仅在该代际内生效）
+    from_participant_id TEXT NOT NULL, -- 原演员：本代际被标记退场
+    to_participant_id   TEXT NOT NULL, -- 替补：继承位置与在线时间，事件序号从头计算
+    position        INTEGER NOT NULL,  -- 交接时转给替补的原演员当前位置
+    last_seen_at    REAL NOT NULL,     -- 交接时转给替补的原演员在线时间
+    created_at      REAL NOT NULL
+);
+
+-- 同一代际内同一原演员至多交接一次（幂等重试的判定依据；不同目标 → 409）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_room_epoch_from
+    ON handoffs(room_id, progress_epoch, from_participant_id);
+-- 同一代际内同一替补至多接手一次（替补“在本代际尚未参与”判定）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_handoffs_room_epoch_to
+    ON handoffs(room_id, progress_epoch, to_participant_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_room ON handoffs(room_id, id);
 """
 
 

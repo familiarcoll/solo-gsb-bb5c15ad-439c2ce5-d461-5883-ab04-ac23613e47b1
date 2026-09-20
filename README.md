@@ -15,6 +15,11 @@ insert/replace/delete，整批原子生效，参与者与公共位置按台词�
 （`PUT /rooms/{room_id}/loop`，独立的 `loop_version` 乐观锁）：quorum 达到
 或越过区间终点时在同一事务把公共位置回到起点、递增进度代际、清空参与者
 进度并累加 `loop_count`；终点上有未释放止点时只停在终点，放行后再回环。
+导演还可安排 **演员临时替补交接**
+（`PUT /rooms/{room_id}/participants/{participant_id}/handoff`）：单一事务
+内把原演员的当前位置与在线时间转给替补（替补事件序号从头计算），公共位置
+不变、推进贡献不中断；原演员本代际退场，迟到上报返回 409；相同目标重试
+幂等，不同目标再交接冲突；交接记录可经 `/handoffs` 查询。
 
 ## 快速启动（单条命令）
 
@@ -125,6 +130,24 @@ curl -X PUT http://localhost:8000/rooms/demo/loop \
   -H 'Content-Type: application/json' \
   -d '{"expected_loop_version":1,"range":null}'
 # → {"changed":true,"loop":null,"loop_version":2,"loop_count":0,"state":{...}}
+
+# 12. 演员临时替补交接：导演把原演员的当前位置与在线时间在单一事务中转给替补
+#     （携带当前 progress_epoch；替补须在本代际尚未参与）
+curl -X PUT http://localhost:8000/rooms/demo/participants/actor-zhou/handoff \
+  -H 'Content-Type: application/json' \
+  -d '{"progress_epoch":1,"substitute_id":"actor-zhou-2"}'
+# → {"changed":true,"progress_epoch":1,
+#    "handoff":{"progress_epoch":1,"from_participant_id":"actor-zhou",
+#               "to_participant_id":"actor-zhou-2","position":2,...},"state":{...}}
+# 替补 actor-zhou-2 的事件序号从头计算（首条 seq=1），公共位置不变、quorum 贡献不中断；
+# 原演员 actor-zhou 本代际的迟到/重试上报返回 409。
+# 相同目标重试为幂等空操作（changed:false）；不同目标再次交接返回 409。
+# 导演校准 / 整体导入 / 循环回环开启新代际后，退场限制解除，原演员可重新上报。
+
+# 13. 查询房间交接记录
+curl http://localhost:8000/rooms/demo/handoffs
+# → {"room_id":"demo","handoffs":[{"id":1,"progress_epoch":1,"from_participant_id":"actor-zhou",
+#    "to_participant_id":"actor-zhou-2","position":2,"last_seen_at":...,"at":...}]}
 ```
 
 ## API 一览
@@ -142,8 +165,10 @@ curl -X PUT http://localhost:8000/rooms/demo/loop \
 | PUT    | `/rooms/{room_id}/holds`        | 批量设置未释放止点（`hold_version` 乐观锁，追加语义） |
 | POST   | `/rooms/{room_id}/holds/release` | 放行止点：版本递增后立即重算，可同响应继续推进 |
 | PUT    | `/rooms/{room_id}/loop`         | 设置/清除循环排练区间（`loop_version` 乐观锁；`range:null` 清除） |
+| PUT    | `/rooms/{room_id}/participants/{participant_id}/handoff` | 演员临时替补交接（携带当前 `progress_epoch` 与替补 ID；相同目标幂等、不同目标 409） |
 | GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、止点、循环配置/版本/次数与最近一次阻挡信息 |
 | GET    | `/rooms/{room_id}/advancements` | 完整推进历史（含每次推进原因）             |
+| GET    | `/rooms/{room_id}/handoffs`     | 房间演员替补交接记录                       |
 | GET    | `/health`                       | 健康检查                                   |
 
 ## 核心语义
@@ -229,6 +254,31 @@ curl -X PUT http://localhost:8000/rooms/demo/loop \
     同时把 `loop_count` 清零；增量修订只清配置、保留 `loop_count`。
   - 回环本身只递增 `progress_epoch` 与 `loop_count`，**不**改变
     `loop_version`；导演手动改设/清除循环才递增配置版本。
+- **演员临时替补交接（handoff）**：导演用
+  `PUT /rooms/{room_id}/participants/{participant_id}/handoff`（请求体
+  `{"progress_epoch": <当前代际>, "substitute_id": <替补 ID>}`）安排原演员
+  临时退场、替补接手，与时钟/止点/循环各版本互不影响（暂停期间也可交接）。
+  - 前置条件：原演员须**已在本代际上报**（参与者表中存在记录；未上报 →
+    **409**）；替补在本代际**尚未参与**——既未自行上报，也未曾接手过本代
+    际的其他交接（否则 → **409**）；替补 ID 不得与原演员相同（**409**）。
+    代际与当前不一致且不是相同目标的重试 → **409**。
+  - 校验通过后在**单一事务**中原子完成：替补参与者记录以原演员的**当前
+    位置**与**在线时间**（`last_seen_at`）建立，`last_seq` 归 0——替补的
+    **事件序号从头计算**（首条上报 `seq` 从 1 开始，重复/乱序规则不变）；
+    原演员的本代际参与者记录删除并在 `handoffs` 中留档标记退场。
+  - **公共位置不变、推进贡献不中断**：交接本身不触发推进重算、不写推进
+    记录；替补立即以继承来的位置与在线时间出现在活跃成员中并计入 quorum，
+    继承的在线时间继续被暂停冻结与离线超时规则承认。
+  - **退场限制**：原演员在本代际的后续迟到/重试上报一律返回 **409**（无论
+    序号新旧），退场者与替补不会同时计入 quorum；新**进度代际**（导演校准、
+    台本整体导入、循环回环）清除全部参与者进度，退场限制随之解除，原演员
+    可在新代际重新上报。
+  - **幂等与冲突**：同一代际对同一原演员、**相同替补**的重试为幂等空操作
+    （返回既有交接记录、`changed: false`，即便携带已过期的代际也视为成功
+    重试）；同一代际对同一原演员指定**不同替补**再次交接返回 **409**、状态
+    不变。交接记录可通过 `GET /rooms/{room_id}/handoffs` 按时间升序查询；
+    增量修订不影响交接留档（替补位置随台本身份重排），整体导入则清空全部
+    交接记录。
 - **离线超时**：超过超时未上报的参与者退出活跃成员列表与推进人数计算；
   重新上报后自动回到活跃集合。
 - **排练暂停/恢复**（`PUT /rooms/{room_id}/clock`，请求体

@@ -2051,3 +2051,368 @@ def test_loop_independent_of_holds_and_clock_versions(client):
     assert current["loop_version"] == 1
     assert current["clock_version"] == 1
     assert current["revision"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 演员临时替补交接（PUT /rooms/{room_id}/participants/{id}/handoff）
+# ---------------------------------------------------------------------------
+
+def handoff(client, room_id, participant_id, progress_epoch, substitute_id):
+    return client.put(
+        f"/rooms/{room_id}/participants/{participant_id}/handoff",
+        json={"progress_epoch": progress_epoch, "substitute_id": substitute_id},
+    )
+
+
+def handoffs(client, room_id):
+    resp = client.get(f"/rooms/{room_id}/handoffs")
+    assert resp.status_code == 200, resp.text
+    return resp.json()["handoffs"]
+
+
+def test_handoff_transfers_position_and_online_time_in_single_transaction(client):
+    room_id = make_room(client, threshold=2, timeout=30)
+    report(client, room_id, "actor-a", 1, 2)
+    client.clock.advance(5)
+    report(client, room_id, "actor-b", 1, 2)
+    assert state(client, room_id)["public_position"] == 2
+
+    resp = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["idempotent"] is False
+    assert body["progress_epoch"] == 1
+    record = body["handoff"]
+    assert record["progress_epoch"] == 1
+    assert record["from_participant_id"] == "actor-a"
+    assert record["to_participant_id"] == "understudy-x"
+    assert record["position"] == 2
+
+    current = state(client, room_id)
+    # 原演员退场、替补以继承来的位置与在线时间出现；公共位置不变
+    assert sorted(p["participant_id"] for p in current["active_participants"]) == [
+        "actor-b", "understudy-x",
+    ]
+    sub = next(p for p in current["active_participants"]
+               if p["participant_id"] == "understudy-x")
+    assert sub["position"] == 2
+    assert sub["last_seq"] == 0  # 替补的事件序号从头计算
+    assert current["public_position"] == 2
+    # 在线时间继承：再推进 25 秒（超时 30）替补仍在线（原演员已在线约 5+ 秒）
+    client.clock.advance(25)
+    assert "understudy-x" in active_ids(client, room_id)
+    client.clock.advance(6)
+    # 继承来的在线时间继续被超时判定承认：超过 30 秒窗口后替补离线
+    assert "understudy-x" not in active_ids(client, room_id)
+
+
+def test_handoff_keeps_quorum_contribution_uninterrupted(client):
+    room_id = make_room(client, threshold=2)
+    report(client, room_id, "actor-a", 1, 4)
+    report(client, room_id, "actor-b", 1, 2)
+    assert state(client, room_id)["public_position"] == 2
+
+    # actor-a 交接给替补：位置 4 的贡献不中断，公共位置不受影响
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    current = state(client, room_id)
+    assert current["public_position"] == 2
+    assert participant_positions(client, room_id) == {"actor-b": 2, "understudy-x": 4}
+
+    # 落后的 actor-b 赶上：替补与 actor-b 共同把公共位置推进到 4
+    resp = report(client, room_id, "actor-b", 2, 4)
+    assert resp.json()["advancement"]["position"] == 4
+    assert state(client, room_id)["public_position"] == 4
+    # 交接本身不写推进记录
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in history] == [2, 4]
+
+
+def test_substitute_event_seq_starts_fresh_and_advances(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 7, 2)  # 原演员已用到 seq 7
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+
+    # 替补的事件序号从头计算：seq=1 即为新序号
+    resp = report(client, room_id, "understudy-x", 1, 4)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["applied"] is True
+    assert state(client, room_id)["public_position"] == 4
+
+    # 替补自身的重复/乱序上报照常幂等
+    dup = report(client, room_id, "understudy-x", 1, 4)
+    assert dup.json()["applied"] is False
+
+
+def test_exited_actor_late_report_returns_409_and_not_double_counted(client):
+    room_id = make_room(client, threshold=2, timeout=60)
+    report(client, room_id, "actor-a", 1, 1)
+    report(client, room_id, "actor-b", 1, 1)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert active_ids(client, room_id) == ["actor-b", "understudy-x"]
+
+    # 原演员本代际迟到上报：409（无论序号新旧）
+    resp = report(client, room_id, "actor-a", 2, 4)
+    assert resp.status_code == 409, resp.text
+    resp = report(client, room_id, "actor-a", 99, 4)
+    assert resp.status_code == 409
+    current = state(client, room_id)
+    assert "actor-a" not in [p["participant_id"] for p in current["active_participants"]]
+    assert current["public_position"] == 1
+
+    # 若把原演员错误计入则 quorum 候选会变成 4；这里替补仍在 1，推进不动
+    report(client, room_id, "understudy-x", 1, 1)
+    assert state(client, room_id)["public_position"] == 1
+    report(client, room_id, "understudy-x", 2, 4)
+    report(client, room_id, "actor-b", 2, 4)
+    assert state(client, room_id)["public_position"] == 4
+
+
+def test_handoff_same_target_retry_is_idempotent(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 2)
+    first = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert first.json()["changed"] is True
+
+    # 相同目标重试：幂等空操作，不新增记录、不改变状态
+    retry = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert retry.status_code == 200, retry.text
+    body = retry.json()
+    assert body["changed"] is False
+    assert body["idempotent"] is True
+    assert body["handoff"]["id"] == first.json()["handoff"]["id"]
+    assert body["handoff"]["to_participant_id"] == "understudy-x"
+    assert len(handoffs(client, room_id)) == 1
+    assert active_ids(client, room_id) == ["understudy-x"]
+
+    # 新代际开启后，携带旧代际的相同目标重试仍视为成功重试
+    put_cursor(client, room_id, 1, 0)  # epoch 1 → 2，参与者与退场限制清除
+    stale_retry = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert stale_retry.status_code == 200
+    assert stale_retry.json()["changed"] is False
+    assert stale_retry.json()["progress_epoch"] == 2
+
+
+def test_handoff_different_target_returns_conflict(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 2)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+
+    # 同一代际对同一原演员指定不同替补：409，状态不变
+    resp = handoff(client, room_id, "actor-a", 1, "understudy-y")
+    assert resp.status_code == 409, resp.text
+    assert active_ids(client, room_id) == ["understudy-x"]
+    assert len(handoffs(client, room_id)) == 1
+
+    # 不同目标在新代际也仍是针对旧代际记录的冲突，而非落库新交接
+    put_cursor(client, room_id, 1, 0)
+    resp = handoff(client, room_id, "actor-a", 1, "understudy-y")
+    assert resp.status_code == 409
+
+
+def test_handoff_requires_source_reported_in_current_epoch(client):
+    room_id = make_room(client)
+    # 原演员从未上报：409
+    resp = handoff(client, room_id, "ghost", 1, "understudy-x")
+    assert resp.status_code == 409, resp.text
+    assert handoffs(client, room_id) == []
+
+
+def test_handoff_rejects_substitute_already_participating(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 2)
+    report(client, room_id, "actor-b", 1, 2)
+
+    # 替补已在本代际自行上报：409
+    resp = handoff(client, room_id, "actor-a", 1, "actor-b")
+    assert resp.status_code == 409, resp.text
+    assert handoffs(client, room_id) == []
+    assert participant_positions(client, room_id) == {"actor-a": 2, "actor-b": 2}
+
+    # 替补 ID 与原演员相同：409
+    resp = handoff(client, room_id, "actor-a", 1, "actor-a")
+    assert resp.status_code == 409
+
+
+def test_handoff_rejects_substitute_already_used_this_epoch(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 2)
+    report(client, room_id, "actor-b", 1, 2)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+
+    # 替补已在本代际接手过 actor-a，不能再接手 actor-b
+    resp = handoff(client, room_id, "actor-b", 1, "understudy-x")
+    assert resp.status_code == 409, resp.text
+    assert active_ids(client, room_id) == ["actor-b", "understudy-x"]
+    assert len(handoffs(client, room_id)) == 1
+
+
+def test_handoff_stale_epoch_returns_409_for_new_target(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 2)
+    put_cursor(client, room_id, 1, 0)  # epoch 1 → 2，参与者清空
+
+    # 旧代际的新交接请求（非重试）：409，不落库
+    resp = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert resp.status_code == 409, resp.text
+    assert handoffs(client, room_id) == []
+
+    # 新代际原演员重新上报后可正常交接（退场限制已清除）
+    report(client, room_id, "actor-a", 1, 1, progress_epoch=2)
+    resp = handoff(client, room_id, "actor-a", 2, "understudy-x")
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is True
+
+
+def test_new_progress_epoch_clears_exit_restriction_after_cursor(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    # 本代际原演员上报被拒
+    assert report(client, room_id, "actor-a", 2, 2).status_code == 409
+
+    # 导演校准开启新代际：退场限制解除，原演员可重新上报
+    put_cursor(client, room_id, 1, 0)
+    resp = report(client, room_id, "actor-a", 1, 1, progress_epoch=2)
+    assert resp.status_code == 200
+    assert resp.json()["applied"] is True
+    assert state(client, room_id)["public_position"] == 1
+
+
+def test_new_progress_epoch_clears_exit_restriction_after_loop(client):
+    room_id = make_room(client, threshold=1)
+    set_loop(client, room_id, 0, 0, 2)
+    report(client, room_id, "actor-a", 1, 1)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert report(client, room_id, "actor-a", 2, 1).status_code == 409
+
+    # 替补触发回环：新代际清空参与者进度，退场限制解除
+    resp = report(client, room_id, "understudy-x", 1, 2)
+    assert resp.json()["advancement"]["looped"] is True
+    assert state(client, room_id)["progress_epoch"] == 2
+    resp = report(client, room_id, "actor-a", 1, 1, progress_epoch=2)
+    assert resp.status_code == 200
+    assert resp.json()["applied"] is True
+
+
+def test_handoff_works_while_paused(client):
+    room_id = make_room(client, threshold=1, timeout=10)
+    report(client, room_id, "actor-a", 1, 2)
+    pause(client, room_id)
+    client.clock.advance(1000)  # 暂停期间超时冻结
+
+    # 暂停只拒绝演员上报；导演交接仍可执行，继承冻结的在线时间
+    resp = handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert resp.status_code == 200, resp.text
+    assert active_ids(client, room_id) == ["understudy-x"]
+
+    # 暂停期间替补上报同样被拒；恢复后替补继承原演员的剩余在线时长
+    assert report(client, room_id, "understudy-x", 1, 2).status_code == 409
+    resume(client, room_id, expected=1)
+    assert active_ids(client, room_id) == ["understudy-x"]
+
+
+def test_handoff_offline_source_still_transfers_position(client):
+    # 原演员已离线超时但本代际有过上报：仍可交接，替补带着位置即刻计入 quorum；
+    # 替补首次上报后即以新的在线时间保持活跃
+    room_id = make_room(client, threshold=2, timeout=10)
+    report(client, room_id, "actor-a", 1, 4)
+    report(client, room_id, "actor-b", 1, 4)
+    client.clock.advance(11)
+    report(client, room_id, "actor-b", 2, 4)  # actor-b 保持活跃，actor-a 离线
+    assert active_ids(client, room_id) == ["actor-b"]
+
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    # 继承的是离线时刻的在线时间：替补尚未自行上报，仍需上报刷新才长期在线；
+    # 但交接后立即上报即可无缝接续 quorum 贡献
+    resp = report(client, room_id, "understudy-x", 1, 4)
+    assert resp.status_code == 200
+    assert state(client, room_id)["public_position"] == 4
+    assert sorted(active_ids(client, room_id)) == ["actor-b", "understudy-x"]
+
+
+def test_handoffs_listing_endpoint(client):
+    room_id = make_room(client)
+    report(client, room_id, "actor-a", 1, 1)
+    report(client, room_id, "actor-b", 1, 2)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    client.clock.advance(3)
+    handoff(client, room_id, "actor-b", 1, "understudy-y")
+
+    records = handoffs(client, room_id)
+    assert len(records) == 2
+    assert records[0] == {
+        "id": records[0]["id"],
+        "progress_epoch": 1,
+        "from_participant_id": "actor-a",
+        "to_participant_id": "understudy-x",
+        "position": 1,
+        "last_seen_at": records[0]["last_seen_at"],
+        "at": records[0]["at"],
+    }
+    assert records[1]["from_participant_id"] == "actor-b"
+    assert records[1]["to_participant_id"] == "understudy-y"
+    assert records[1]["position"] == 2
+    assert records[0]["id"] < records[1]["id"]
+    assert records[1]["at"] > records[0]["at"]
+
+    # 不存在的房间：404
+    assert client.get("/rooms/nope/handoffs").status_code == 404
+    assert handoff(client, "nope", "actor-a", 0, "x").status_code == 404
+
+
+def test_reimport_lines_clears_handoffs_and_exit_restriction(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 4)
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert len(handoffs(client, room_id)) == 1
+
+    # 整体导入：交接记录随进度一并清空
+    client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert handoffs(client, room_id) == []
+    current = state(client, room_id)
+    assert current["progress_epoch"] == 2
+    assert current["active_participants"] == []
+
+    # 新代际原演员与替补都可重新上报，退场限制不再生效
+    resp = report(client, room_id, "actor-a", 1, 1, progress_epoch=2)
+    assert resp.status_code == 200
+    resp = report(client, room_id, "understudy-x", 1, 1, progress_epoch=2)
+    assert resp.status_code == 200
+
+
+def test_patch_lines_keeps_handoffs_and_remaps_substitute_position(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)  # 指向「甲：请坐。」
+    handoff(client, room_id, "actor-a", 1, "understudy-x")
+    assert participant_positions(client, room_id) == {"understudy-x": 2}
+
+    # 增量修订不改变代际：替补位置按台词身份重排，退场限制保留
+    patch_lines(client, room_id, 1, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert participant_positions(client, room_id) == {"understudy-x": 3}
+    assert state(client, room_id)["progress_epoch"] == 1
+    assert report(client, room_id, "actor-a", 2, 3).status_code == 409
+    records = handoffs(client, room_id)
+    assert len(records) == 1  # 交接留档保留（记录的是交接发生时的位置）
+    assert records[0]["position"] == 2
+
+
+def test_handoff_request_validation(client):
+    room_id = make_room(client)
+    # 缺少 substitute_id / progress_epoch：422
+    resp = client.put(
+        f"/rooms/{room_id}/participants/actor-a/handoff",
+        json={"progress_epoch": 1},
+    )
+    assert resp.status_code == 422
+    resp = client.put(
+        f"/rooms/{room_id}/participants/actor-a/handoff",
+        json={"substitute_id": "understudy-x"},
+    )
+    assert resp.status_code == 422
+    # 空替补 ID：422
+    resp = handoff(client, room_id, "actor-a", 1, "")
+    assert resp.status_code == 422
+    assert handoffs(client, room_id) == []

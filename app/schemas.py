@@ -184,3 +184,21 @@ class LoopUpdate(BaseModel):
     range: Optional[LoopRange] = Field(
         description="循环区间；null 表示清除循环"
     )
+
+
+class HandoffRequest(BaseModel):
+    """演员临时替补交接：携带当前进度代际与替补 ID。
+
+    原演员须在本代际已上报、替补在本代际尚未参与（未上报且未接手过其他
+    交接）。交接在单一事务中把原演员的当前位置与在线时间转给替补，替补的
+    事件序号从头计算；原演员在本代际被标记退场，后续迟到上报返回 409。
+    相同目标的重试为幂等空操作；对同一原演员指定不同替补再次交接返回 409。
+    新进度代际（导演校准 / 整体导入 / 回环）清除退场限制。
+    """
+
+    progress_epoch: int = Field(
+        ge=0, description="客户端已知的进度代际；与当前不一致时返回 409"
+    )
+    substitute_id: str = Field(
+        min_length=1, max_length=100, description="替补演员的参与者 ID"
+    )
